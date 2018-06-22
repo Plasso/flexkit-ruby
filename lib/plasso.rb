@@ -3,23 +3,10 @@ require 'json'
 require 'uri'
 require 'date'
 
-def send_request(method, path, data)
-  host = 'https://plasso.com'
-
-  uri = URI("#{host}#{path}")
-  http = Net::HTTP.new(uri.host, uri.port)
-  request = nil
-  if method == 'POST'
-    request = Net::HTTP::Post.new(uri.request_uri)
-  elsif method == 'DELETE'
-    request = Net::HTTP::Delete.new(uri.request_uri)
-  end
-
-  request.body = JSON.generate(data)
-  request['Content-Type'] = 'application/json'
-
-  http.request(request) do |response|
-    return JSON.parse(response.body)
+def sendGetRequest(url, &block)
+  uri = URI(url)
+  Net::HTTP.get_response(uri) do |response|
+    yield JSON.parse(response.body)
   end
 end
 
@@ -30,30 +17,39 @@ def parseCookies(request)
   if rc
     rcSplit = rc.split(';')
     rcSplit.each do |cookie|
-      parts = cookie.split('=');
-      list[parts[0].strip!] = URI.unescape(parts.slice(1).join('='));
+      parts = cookie.split('=')
+      list[parts[0].strip!] = URI.unescape(parts.slice(1).join('='))
     end
   end
 end
 
 def setCookie(res, value, days, path) {
-  expdate = new Date();
-  expdate.setDate(expdate.getDate() + days);
+  expdate = DateTime.new(DateTime.now.year, DateTime.now.mon, (DateTime.now.mday + days))
   if (res.cookie) {
-    res.cookie('_plasso_flexkit', value, { path, expires: expdate });
+    # Convert from JS to Ruby
+    res.cookie('_plasso_flexkit', value, { path, expires: expdate })
   elsif
-    cookies = res.getHeader('Set-Cookie');
+    # Convert from JS to Ruby
+    cookies = res.getHeader('Set-Cookie')
     if !cookies
-      cookies = [];
+      cookies = []
     end
-    cookies.push(`_plasso_flexkit=${value};expires=${expdate.toUTCString()};path=${path}`);
-    res.setHeader('Set-Cookie', cookies);
+    cookies.push("_plasso_flexkit=#{value};expires=#{expdate.toUTCString()};path=#{path}")
+    # Convert from JS to Ruby
+    res.setHeader('Set-Cookie', cookies)
   end
 end
 
 def clearCookie(res, path)
   setCookie(res, '{}', -2, path);
 end
+
+def redirect(res, location) {
+  # Convert from JS to Ruby
+  res.writeHead(302, { 'Location': location })
+  res.end();
+end
+
 
 GRAPHQL_GET_DATA = <<~HEREDOC
   {
@@ -122,94 +118,114 @@ HEREDOC
 
 module Plasso
 
-  class Member
-    def initialize(public_key, token)
-      @public_key = public_key
-      @token = token
+  class Flexkit
+    self.member
+    self.token
+    self.space
+    self.memberData
+
+    def deserialize(data)
+      props = JSON.parse(data)
+      self.member = props.member
+      self.space = props.space
+      self.token = props.token
     end
 
-    def update_settings(request)
-      request['token'] = @token
-      request['public_key'] = @public_key
-      send_request("POST", "/api/services/user?action=settings", request)
+    def serialize
+      return JSON.generate({ :member => self.member, :space => self.space, :token => self.token })
     end
 
-    def update_credit_card(request)
-      request['token'] = @token
-      request['public_key'] = @public_key
-      send_request("POST", "/api/services/user?action=cc", request)
+    def loadFromRequest(req)
+      cookies = parseCookies(req)
+      if !cookies._plasso_flexkit.nil?
+        deserialize(URI.unescape(cookies._plasso_flexkit))
+      end
     end
 
-    def delete
-      send_request("DELETE", "/api/service/user?action=cancel", {"public_key" => @public_key, "token" => @token})
+    def saveToResponse(res)
+      # what is this.serialize
+      setCookie(res, this.serialize(), 1, '/')
     end
 
-    def get_data
-      request = {
-        "query" => GRAPHQL_GET_DATA,
-        "variables" => {
-          "token" => @token
-        }
-      }
 
-      response = send_request("POST", "/graphql", request)
-
-      if response['errors']
-        raise response['errors'][0]['message']
+    def authenticate(options, &block)
+      if options.nil? || !options.token
+        # is this valid?
+        return cb(raise Exception.new('token required'))
       end
 
-      member_data = {
-        "credit_card_last4" => response['data']['member']['ccLast4'],
-        "credit_card_type" => response['data']['member']['ccType'],
-        "email" => response['data']['member']['email'],
-        "id" => response['data']['member']['id'],
-        "name" => response['data']['member']['name'],
-        "plan" => response['data']['member']['plan']['alias']
-      }
+      query = self.generateMemberUrlQuery(options.token)
+      url = "https://api.plasso.com/?query=#{query}"
 
-      if (response['data']['member']['shippingInfo'])
-        member_data['shipping_name'] = response['data']['member']['shippingInfo']['name']
-        member_data['shipping_address'] = response['data']['member']['shippingInfo']['address']
-        member_data['shipping_city'] = response['data']['member']['shippingInfo']['city']
-        member_data['shipping_state'] = response['data']['member']['shippingInfo']['state']
-        member_data['shipping_zip'] = response['data']['member']['shippingInfo']['zip']
-        member_data['shipping_country'] = response['data']['member']['shippingInfo']['country']
-      end
+      sendGetRequest(url) { |apiResponse|
+        if (apiResponse.statusCode !== 200) {
+          rawData = ''
+          apiResponse.on('data', (chunk) => rawData += chunk);
+          apiResponse.on('end', () => { cb(new Error(rawData)); });
+          return;
+        end
+        apiResponse.setEncoding('utf8');
+        rawData = '';
+        apiResponse.on('data', (chunk) => rawData += chunk);
+        apiResponse.on('end', () => {
+          begin
+            parsedData = JSON.parse(rawData);
+            if (parsedData.errors && parsedData.errors.length > 0) {
+              return cb(raise Exception.new(JSON.generate(parsedData.errors)));
+            end
 
-      if (response['data']['member']['dataFields'])
-        member_data['data_fields'] = response['data']['member']['dataFields']
-      end
+            self.member = parsedData.data.member;
+            self.space = parsedData.data.member.space;
+            self.memberData = parsedData.data;
 
-      return member_data
+            yield null;
+          rescue
+            yield raise Exception.new('Failed to get data.');
+          end
+        });
+      end # what to do with this?   }).on('error', cb);
     end
 
-    def log_out()
-      send_request("POST", "/api/service/logout", {"public_key" => @public_key, "token" => @token});
+    def isAuthenticated(options, cb)
+      if !self.member
+        cb(false);
+      else
+        cb(true);
+      end
+    end
+
+    def middleware(req, res, next)
+      parsedUrl = URI.parse(req.url, true);
+      logoutUrl = `//${req.headers.host}`;
+
+      loadFromRequest(req);
+
+      if parsedUrl.query._plasso_token
+        plasso.token = parsedUrl.query._plasso_token;
+      end
+
+      if !parsedUrl.query._logout.nil? || parsedUrl.query._plasso_token === 'logout'
+        clearCookie(res, '/');
+        redirect(res, plasso.space ? plasso.space.logoutUrl : logoutUrl)
+        return;
+      end
+
+      if plasso.token.nil?
+        clearCookie(res, '/')
+        redirect(res, self.space ? self.space.logoutUrl : logoutUrl)
+        return;
+      end
+
+      authenticate({ :token => plasso.token }) { |returnValue|
+        if !returnValue
+          clearCookie(res, '/')
+          redirect(res, plasso.space ? plasso.space.logoutUrl : logoutUrl)
+          return;
+        end
+        setCookie(res, JSON.stringify(plasso), 1, '/')
+        # next();
+      end
     end
   end
-
-  def self.authenticate(options, cb)
-
-  end
-
-  def self.isAuthenticated(options, cb)
-    send_request("POST", "/api/payments", request)
-  end
-
-  def self.log_in(request)
-    response = send_request("POST", "/api/service/login", request)
-
-    return Member.new(request['public_key'], response['token'])
-  end
-
-  def self.middleware()
-    request['subscription_for'] = 'space'
-
-    response = send_request("POST", "/api/subscriptions", request)
-
-    return Member.new(request['public_key'], response['token'])
-  end
-
-  private_constant :Member
 
 end
