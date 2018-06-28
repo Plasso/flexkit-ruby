@@ -3,23 +3,10 @@ require 'json'
 require 'uri'
 require 'date'
 
-def sendGetRequest(url, &block)
+def send_get_request(url, &block)
   uri = URI(url)
   Net::HTTP.get_response(uri) do |response|
-    yield JSON.parse(response.body)
-  end
-end
-
-def parseCookies(request)
-  list = {};
-  rc = req.headers.cookie;
-
-  if rc
-    rcSplit = rc.split(';')
-    rcSplit.each do |cookie|
-      parts = cookie.split('=')
-      list[parts[0].strip!] = URI.unescape(parts.slice(1).join('='))
-    end
+    block.call(JSON.parse(response.body))
   end
 end
 
@@ -119,84 +106,73 @@ HEREDOC
 module Plasso
 
   class Flexkit
-    self.member
-    self.token
-    self.space
-    self.memberData
+
+    def initialize()
+      @member = nil
+      @token = nil
+      @space = nil
+      @memberData = nil
+    end
 
     def deserialize(data)
       props = JSON.parse(data)
-      self.member = props.member
-      self.space = props.space
-      self.token = props.token
+      @member = props.member
+      @space = props.space
+      @token = props.token
     end
 
     def serialize
-      return JSON.generate({ :member => self.member, :space => self.space, :token => self.token })
+      return JSON.generate({ :member => @member, :space => @space, :token => @token })
     end
 
     def loadFromRequest(req)
-      cookies = parseCookies(req)
-      if !cookies._plasso_flexkit.nil?
-        deserialize(URI.unescape(cookies._plasso_flexkit))
+      cookies = req.to_hash['set-cookie'].collect{|ea|ea[/^.*?;/]}.join
+      if !cookies['_plasso_flexkit'].nil?
+        deserialize(URI.unescape(cookies['_plasso_flexkit']))
       end
     end
 
     def saveToResponse(res)
-      # what is this.serialize
-      setCookie(res, this.serialize(), 1, '/')
+      setCookie(res, self.serialize(), 1, '/')
     end
 
 
-    def authenticate(options, &block)
+    def authenticate(options)
       if options.nil? || !options.token
-        # is this valid?
-        return cb(raise Exception.new('token required'))
+        raise 'token required'
       end
 
       query = self.generateMemberUrlQuery(options.token)
       url = "https://api.plasso.com/?query=#{query}"
 
-      sendGetRequest(url) { |apiResponse|
-        if (apiResponse.statusCode !== 200) {
-          rawData = ''
-          apiResponse.on('data', (chunk) => rawData += chunk);
-          apiResponse.on('end', () => { cb(new Error(rawData)); });
-          return;
+      send_get_request(url) { |apiResponse|
+        if (apiResponse.code !== 200) {
+          raise apiResponse.body
         end
-        apiResponse.setEncoding('utf8');
-        rawData = '';
-        apiResponse.on('data', (chunk) => rawData += chunk);
-        apiResponse.on('end', () => {
-          begin
-            parsedData = JSON.parse(rawData);
-            if (parsedData.errors && parsedData.errors.length > 0) {
-              return cb(raise Exception.new(JSON.generate(parsedData.errors)));
-            end
 
-            self.member = parsedData.data.member;
-            self.space = parsedData.data.member.space;
-            self.memberData = parsedData.data;
-
-            yield null;
-          rescue
-            yield raise Exception.new('Failed to get data.');
+        begin
+          parsedData = JSON.parse(apiResponse.body)
+          if (parsedData['errors'] && parsedData['errors'].length > 0) {
+            raise JSON.generate(parsedData['errors'])
           end
-        });
-      end # what to do with this?   }).on('error', cb);
+
+          @member = parsedData['data']['member'];
+          @space = parsedData['data']['member']['space'];
+          @memberData = parsedData['data'];
+        rescue
+          raise 'Failed to get data.'
+        end
+
+      end
     end
 
     def isAuthenticated(options, cb)
-      if !self.member
-        cb(false);
-      else
-        cb(true);
-      end
+      return !!@member
     end
 
     def middleware(req, res, next)
       parsedUrl = URI.parse(req.url, true);
-      logoutUrl = `//${req.headers.host}`;
+      logoutUrl = "//#{req.headers.host}";
 
       loadFromRequest(req);
 
@@ -212,7 +188,7 @@ module Plasso
 
       if plasso.token.nil?
         clearCookie(res, '/')
-        redirect(res, self.space ? self.space.logoutUrl : logoutUrl)
+        redirect(res, @space ? @space.logoutUrl : logoutUrl)
         return;
       end
 
